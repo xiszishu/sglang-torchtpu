@@ -54,12 +54,21 @@ from sglang_tpu.attention_pallas_rpa_dcp import (
     own_heads,
     sink_fold,
 )
+from sglang_tpu.attention_pallas_rpa_pcp import (
+    PcpRingMetadata,
+    build_pcp_ring_metadata,
+    check_pcp_ring_layer,
+    dcp_stripe_group,
+    forward_pcp_ring,
+    init_pcp_ring_op,
+)
 from sglang_tpu.cp_forward import (
     TpuCpBatchLayout,
     all_gather_and_write_kv,
     get_tpu_cp_layout,
 )
 from sglang_tpu.cp_layout import TpuCpHostLayout
+from sglang_tpu.cp_mode import pcp_ring_enabled
 from sglang_tpu.envs import envs
 from sglang_tpu.host_metadata_cache import HostMetadataCache
 from sglang_tpu.kv_row_write import (
@@ -156,6 +165,11 @@ class PallasForwardMetadata:
     dcp_kv_lens_global: torch.Tensor | None = None
     # i32[1]  this rank's index inside its DCP group
     dcp_cp_rank: torch.Tensor | None = None
+    # Ring-mode prefill context parallelism only (SGLANG_TPU_PCP_MODE=ring):
+    # the fused ring kernel's operands. ``cp_write_segments`` then holds only
+    # the runs of the pages this rank owns, at their slots in its page stripe,
+    # and the fields above describe the new-token rows.
+    cp_ring: PcpRingMetadata | None = None
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
@@ -606,10 +620,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # allocator hands out slots from a pool widened by dcp, so one logical
         # page spans page_size * dcp tokens over page_size physical slots per
         # rank: rank r's physical page holds the r-th page_size run of it.
+        # Ring-mode prefill CP stripes over the attention-CP group instead.
         parallel = get_parallel()
+        pcp_ring = pcp_ring_enabled()
         self._dcp = parallel.attn_dcp_size
-        self._dcp_rank = parallel.attn_dcp_rank if self._dcp > 1 else 0
-        self._dcp_group = parallel.dcp_group if self._dcp > 1 else None
+        self._dcp_rank, self._dcp_group, self._dcp_replicates_qo = dcp_stripe_group(
+            parallel, pcp_ring=pcp_ring
+        )
         self._page_stride = self.page_size * self._dcp
         self._cp_rank_t: torch.Tensor | None = None
         self._cp_rank_index: torch.Tensor | None = None
@@ -719,6 +736,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # traced region — dynamo can't handle ``inspect.signature`` on the
         # wrapped JAX function. The forward path then just looks the op up.
         self._op = self._build_kernel_op()
+        # Ring-mode prefill context parallelism: the fused ring op replaces the
+        # all-gather-and-write + full attention of gather mode.
+        self._pcp_ring_op = (
+            init_pcp_ring_op(self, model_runner.device) if pcp_ring else None
+        )
         if get_parallel().attn_cp_size > 1 and model_runner.device == "tpu":
             get_write_rows_op()
 
@@ -1329,6 +1351,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 "req_to_token (SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1)."
             )
         host = cp_layout.host
+        if host.ring is not None:
+            return build_pcp_ring_metadata(self, forward_batch, host)
         page_size = self.page_size
         pages_per_seq = _get_pages_per_seq(self.max_context_len, page_size)
         num_rows = 2 * host.pad_b
@@ -1685,7 +1709,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         if is_swa_layer and self.forward_metadata.cp_swa_write_segments is not None:
             cp_write_segments = self.forward_metadata.cp_swa_write_segments
             cp_write_num_segments = self.forward_metadata.cp_swa_write_num_segments
-        if cp_write_segments is not None:
+        if cp_write_segments is not None and self.forward_metadata.cp_ring is None:
             all_gather_and_write_kv(
                 kv_cache=kv_cache,
                 k=k if quantize_kv is None else k_compute,
@@ -1697,7 +1721,28 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             )
 
         kv_lens = self._kv_lens(forward_batch)
-        if self._dcp > 1:
+        if self.forward_metadata.cp_ring is not None:
+            check_pcp_ring_layer(
+                layer,
+                sinks=sinks,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                causal=use_causal_mask,
+                pack=pack,
+            )
+            out = forward_pcp_ring(
+                self.forward_metadata,
+                self._pcp_ring_op,
+                q,
+                k if quantize_kv is None else k_compute,
+                v if quantize_kv is None else v_compute,
+                kv_cache,
+                quantize_kv=quantize_kv,
+                sm_scale=float(layer.scaling),
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+        elif self._dcp > 1:
             if not use_causal_mask:
                 raise NotImplementedError(
                     "Decode context parallelism supports only causal attention."
@@ -1812,8 +1857,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         cp = self._dcp
         group = self._dcp_group
 
-        if q.shape[1] == cp * layer_q_heads:
+        replicates_qo = self._dcp_replicates_qo
+        if q.shape[1] == cp * layer_q_heads or replicates_qo:
             # --dcp-replicate-q-proj: the layer projected the group's heads.
+            # replicates_qo (attention TP 1, ring-mode prefill CP): q and o_proj
+            # heads are replicated across the group, so the kernel runs on this
+            # rank's own queries and the merge below keeps all heads.
             q_all = q.contiguous()
         else:
             q_all = gather_heads(q.contiguous(), group, cp, self._cp_rank_mask)
@@ -1853,6 +1902,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 cp,
                 self._cp_rank_mask,
                 self._cp_rank_index,
+                replicated_o_proj=replicates_qo,
             )
             if sinks is not None:
                 out = sink_fold(out, lse, sinks)
@@ -1922,10 +1972,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             cp,
             self._cp_rank_mask,
             self._cp_rank_index,
+            replicated_o_proj=replicates_qo,
         )
 
-        out_chunk = own_heads(out_chunk, cp, self._cp_rank_index).float()
-        lse_chunk = own_heads(lse_chunk, cp, self._cp_rank_index)
+        if replicates_qo:
+            out_chunk = out_chunk.float()
+        else:
+            out_chunk = own_heads(out_chunk, cp, self._cp_rank_index).float()
+            lse_chunk = own_heads(lse_chunk, cp, self._cp_rank_index)
         # A single-token row attended its token in the prefix pass; the chunk
         # pass leaves such rows (and a mixed batch's decode rows, outside its
         # range) unprocessed, with LSE -inf, so the merge weighs them zero.
