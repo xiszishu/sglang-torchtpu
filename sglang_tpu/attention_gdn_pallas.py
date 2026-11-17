@@ -519,7 +519,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # int64 for the verify commit's index_copy_ (the table itself is int32).
         if slots.dtype != torch.int64:
             slots = slots.long()
-        if pool.mamba_v2p_table is None:
+        if self._state_ids.read_v2p is None:
             self._slot_memo = (
                 weakref.ref(req_pool_indices),
                 req_pool_indices._version,

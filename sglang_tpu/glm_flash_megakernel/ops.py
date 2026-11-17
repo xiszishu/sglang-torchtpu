@@ -349,7 +349,7 @@ class GlmFlashMegakernel:
         mamba = self._mamba
         return dict(
             slot_map=self._req_pool.req_index_to_mamba_index_mapping,
-            v2p=self._req_pool.mamba_v2p_table,
+            v2p=self._lin._state_ids.read_v2p,
             read_offsets=mamba.checkpoint_read_offsets,
             window_start=mamba.window_start or 0,
             checkpoint_width=mamba.checkpoint_width,
