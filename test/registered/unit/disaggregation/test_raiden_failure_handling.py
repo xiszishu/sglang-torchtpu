@@ -83,6 +83,7 @@ def _prefill_manager():
     mgr.failure_records = {}
     mgr.failure_lock = threading.Lock()
     mgr._state_lock = threading.Lock()
+    mgr._drain_lock = threading.Lock()
     mgr._status_lock = threading.Lock()
     mgr._announce_lock = threading.Lock()
     mgr._completed_send = set()
@@ -131,6 +132,7 @@ def _decode_manager():
     mgr.failure_records = {}
     mgr.failure_lock = threading.Lock()
     mgr._state_lock = threading.Lock()
+    mgr._drain_lock = threading.Lock()
     mgr._status_lock = threading.Lock()
     mgr._aborted = {}
     mgr._failed = set()
@@ -374,6 +376,7 @@ def _decode_manager_stub(**overrides):
         failure_lock=threading.Lock(),
         waiting_timeout=300,
         _state_lock=threading.Lock(),
+        _drain_lock=threading.Lock(),
         _aborted={},
         _prefill=None,
         _failed=set(),
@@ -442,6 +445,7 @@ class TestReceiverFailurePaths(unittest.TestCase):
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._aborted = {}
         mgr._failed = set()
@@ -572,6 +576,7 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
             bootstrap_timeout=bootstrap_timeout,
             waiting_timeout=300,
             _state_lock=threading.Lock(),
+            _drain_lock=threading.Lock(),
             _aborted={},
             _prefill=PrefillState(
                 announce_pages=1,
@@ -2064,6 +2069,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         mgr = RaidenKVManager.__new__(RaidenKVManager)
         mgr.attn_tp_rank = 0
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr.connection_lock = threading.Lock()
         mgr.connection_pool = {
@@ -2106,6 +2112,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         mgr = RaidenKVManager.__new__(RaidenKVManager)
         mgr.attn_tp_rank = 0
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr.connection_lock = threading.Lock()
         mgr.connection_pool = {}
