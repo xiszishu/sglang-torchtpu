@@ -143,13 +143,9 @@ def _extend_batch(allocator, pool, device):
         maybe_evict_swa=lambda: None,
         reqs=[
             SimpleNamespace(
-                prefix_indices=prefix,
-                kv=SimpleNamespace(
-                    holds_kv=False,
-                    req_pool_idx=None,
-                    kv_allocated_len=0,
-                    kv_committed_len=0,
-                ),
+                prefix_len=len(prefix),
+                prefix_rows=prefix,
+                kv=ReqKvInfo(),
             )
             for prefix in prefix_rows
         ],
@@ -166,8 +162,13 @@ def _extend_batch(allocator, pool, device):
             page_size=PAGE,
             token_to_kv_pool_allocator=allocator,
             supports_prefix_sharing=lambda: False,
+            prefix_device_indices=lambda req: req.prefix_rows,
+            maybe_hand_to_session=lambda req: None,
+            req_to_token_pool=pool,
         ),
+        token_to_kv_pool_allocator=allocator,
         req_to_token_pool=pool,
+        hisparse_coordinator=None,
     )
 
 
@@ -180,6 +181,8 @@ class TestAllocHostResidentPool(CustomTestCase):
             # write_cache_indices skips Triton for torch_native, as it does for
             # the Pallas backends once sglang_tpu.patches has run.
             (allocation, "attention_backends", lambda: ("torch_native",) * 2),
+            # Room is ample; eviction is outside what these tests check.
+            (allocation, "_room_in", lambda tree_cache: lambda demand: None),
         ):
             patcher = patch.object(target, name, value, create=True)
             patcher.start()
@@ -351,9 +354,20 @@ class TestAllocHostResidentPool(CustomTestCase):
         pool.req_to_token[ROWS[0], :6] = torch.arange(4, 10)
         result = torch.tensor(EXTEND_LOCS, dtype=torch.int32)
         allocator = Mock(
-            spec=["page_size", "alloc_extend", "free", "forward_write_target"],
+            spec=[
+                "page_size",
+                "alloc_extend",
+                "free",
+                "forward_write_target",
+                "storage",
+                "state",
+                "get_extend_allocation_demand",
+            ],
             page_size=PAGE,
             forward_write_target=nullcontext,
+            storage=None,
+            state=None,
+            get_extend_allocation_demand=lambda *args, **kwargs: 0,
         )
         allocator.alloc_extend.return_value = result
         batch = _extend_batch(allocator, pool, "cpu")
