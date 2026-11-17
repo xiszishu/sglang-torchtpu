@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
+from sglang.srt.platforms import current_platform
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.kv_free_fence import KVFreeFence, fence_hicache_backups
 from sglang_tpu.kv_pool_host import (
@@ -45,6 +46,7 @@ from sglang_tpu.raiden_transfer import RaidenKVTransfer
 from sglang_tpu.tpu_dma_hybrid_cache_controller import (
     TpuDMAHybridCacheController,
 )
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 
 class _FakeFuture:
@@ -154,6 +156,14 @@ class TestPlainKvController(CustomTestCase):
             patch.object(hybrid_pool_assembler, "prepare_host_pool_config"),
             patch.object(hybrid_pool_assembler, "build_host_pool_group"),
             patch.object(hybrid_pool_assembler, "get_memory") as memory,
+            # On TPU the platform picks the DMA hybrid controller for raiden.
+            patch.object(
+                current_platform,
+                "get_hybrid_cache_controller_cls",
+                lambda io_backend: TpuSRTPlatform.get_hybrid_cache_controller_cls(
+                    current_platform, io_backend
+                ),
+            ),
         ):
             memory.return_value.hicache_io_backend = "raiden"
             controller = (
