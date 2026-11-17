@@ -1413,11 +1413,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         ):
             return
         buckets = sorted(set(self.b_bucketer.buckets) | {self._extend_compile_cap()})
-        backends = (
-            runner.attn_backend,
-            runner.decode_attn_backend,
-            *(runner.decode_attn_backend_group or ()),
-        )
+        backends = (runner.attn_backend,)
         max_live = min(runner.max_running_requests, max(buckets))
         runner.req_to_token_pool._tpu_relay_bucketer = self.b_bucketer
         from sglang_tpu.allocator_tpu import host_return_allocators
